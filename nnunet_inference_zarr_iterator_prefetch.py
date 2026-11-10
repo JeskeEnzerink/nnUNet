@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Iterator-based copy of wirrbel's Zarr inference script.
+"""GPU-batched copy of wirrbel's Zarr inference script.
 
 CPU preprocessing can run ahead in spawned processes; GPU inference and Zarr
-writes stay in the parent. Results are collected in bounded groups, not GPU
-minibatches. The original normalization, label sums and empty-block sentinel
+writes stay in the parent. Sliding-window patches within each Zarr block are
+batched on the GPU. The original normalization, label sums and empty-block sentinel
 are preserved (these outputs are not probability maps).
 """
 
@@ -21,6 +21,69 @@ import numpy as np
 import torch
 import zarr
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.inference.sliding_window_prediction import compute_gaussian
+from nnunetv2.utilities.helpers import empty_cache
+from tqdm import tqdm
+
+
+class BatchedNNUNetPredictor(nnUNetPredictor):
+    """Batch patches within one block, preserving nnUNet's weighted stitching.
+
+    Uses the installed predictor for preprocessing, padding, mirroring, folds,
+    autocast and export. This override targets the repository's current private
+    sliding-window method; recheck compatibility after updating nnUNet.
+    """
+
+    def __init__(self, *args, gpu_batch_size=4, **kwargs):
+        if not isinstance(gpu_batch_size, int) or isinstance(gpu_batch_size, bool) or gpu_batch_size < 1:
+            raise ValueError('gpu_batch_size must be a positive integer')
+        super().__init__(*args, **kwargs)
+        self.gpu_batch_size = gpu_batch_size
+
+    @torch.inference_mode()
+    def _internal_predict_sliding_window_return_logits(self, data, slicers, do_on_device=True):
+        if self.gpu_batch_size == 1:
+            return super()._internal_predict_sliding_window_return_logits(data, slicers, do_on_device)
+
+        results_device = self.device if do_on_device else torch.device('cpu')
+        predicted_logits = n_predictions = gaussian = workon = predictions = prediction = None
+        try:
+            empty_cache(self.device)
+            data = data.to(results_device)
+            predicted_logits = torch.zeros(
+                (self.label_manager.num_segmentation_heads, *data.shape[1:]),
+                dtype=torch.half, device=results_device)
+            n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
+            gaussian = compute_gaussian(
+                tuple(self.configuration_manager.patch_size), sigma_scale=1. / 8,
+                value_scaling_factor=10, device=results_device
+            ) if self.use_gaussian else 1
+
+            with tqdm(total=len(slicers), disable=not self.allow_tqdm) as progress:
+                for start in range(0, len(slicers), self.gpu_batch_size):
+                    batch_slicers = slicers[start:start + self.gpu_batch_size]
+                    # All sliding-window patches have the model's patch size,
+                    # including border patches after nnUNet's padding step.
+                    workon = torch.stack([data[sl] for sl in batch_slicers]).to(self.device)
+                    predictions = self._internal_maybe_mirror_and_predict(workon).to(results_device)
+                    for prediction, sl in zip(predictions, batch_slicers):
+                        if self.use_gaussian:
+                            prediction *= gaussian
+                        predicted_logits[sl] += prediction
+                        n_predictions[sl[1:]] += gaussian
+                    # Release this batch before allocating the next one.
+                    workon = predictions = prediction = None
+                    progress.update(len(batch_slicers))
+
+            torch.div(predicted_logits, n_predictions, out=predicted_logits)
+            if not torch.isfinite(predicted_logits).all():
+                raise RuntimeError('Non-finite sliding-window logits; check Gaussian weights and precision')
+            return predicted_logits
+        except Exception:
+            del data, predicted_logits, n_predictions, gaussian, workon, predictions, prediction
+            empty_cache(self.device)
+            empty_cache(results_device)
+            raise
 
 
 def generate_slice_blocks(shape, block_size=(200, 200, 200), overlap=0.5):
@@ -179,13 +242,15 @@ def main():
     spacing = (1.0, 1.0, 1.0)  # Replace with actual voxel spacing in z, y, x order.
     num_processes_preprocessing = 2  # Set to 0 to compare serial preprocessing.
     blocks_per_call = 8  # Bounds retained results; this is not a GPU batch size.
+    gpu_batch_size = 4  # Actual patches per GPU call; try 2 if GPU memory runs out.
 
     input_zarr_location = os.path.abspath(input_zarr_location)
     output_zarr_location, dataset_name = os.path.split(input_zarr_location)
     input_data = zarr.open_group(input_zarr_location, mode='r')['0']
     bounds = load_json(input_zarr_location + '.intensity.json')
 
-    predictor = nnUNetPredictor(
+    predictor = BatchedNNUNetPredictor(
+        gpu_batch_size=gpu_batch_size,
         tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
         perform_everything_on_device=True, device=torch.device('cuda', 0),
         verbose=False, verbose_preprocessing=False, allow_tqdm=False
